@@ -1,48 +1,33 @@
+# ========== IMPORTS ==========
+
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from typing import List
-import pytesseract
-from PIL import Image
-import pdfplumber
-import io
 import os
-import tempfile
-import ocrmypdf
-
-from . import models, schemas, crud
-from .database import SessionLocal, engine
-
-
+import io
+import time
+import pdfplumber
 import requests
-from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
 
-def analyse_url(url: str):
-    try:
-        response = requests.get(url, timeout=5)
-        response.raise_for_status()
-        
-        soup = BeautifulSoup(response.text, "html.parser")
-        title = soup.title.string.strip() if soup.title else "Pas de titre trouvé"
-        
-        description_tag = soup.find("meta", attrs={"name": "description"})
-        description = description_tag["content"].strip() if description_tag and "content" in description_tag.attrs else "Pas de description trouvée"
-        
-        return {
-            "url": url,
-            "titre": title,
-            "description": description
-        }
-    except Exception as e:
-        return {
-            "url": url,
-            "erreur": str(e)
-        }
+# App interne
+from app import models, schemas, crud
+from app.database import SessionLocal, engine
+
+# ========== ENVIRONNEMENT & OPENAI ==========
+
+# Chargement de la clé API
+load_dotenv()
+client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# ========== INIT FASTAPI APP ==========
 
 app = FastAPI()
-
 models.Base.metadata.create_all(bind=engine)
 
+# ========== CORS POLICY ==========
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
@@ -51,12 +36,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ========== BASE DB DEPENDENCY ==========
+
 def get_db():
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
+
+# ========== ROUTES PRODUITS EXISTANTES ==========
 
 @app.get("/products", response_model=list[schemas.Product])
 def read_products(db: Session = Depends(get_db)):
@@ -73,105 +62,235 @@ def read_product(product_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Produit non trouvé")
     return db_product
 
+# Route pour sauvegarder une analyse
+@app.post("/save_analysis", response_model=schemas.Product)
+def save_analysis(product: schemas.ProductCreate, db: Session = Depends(get_db)):
+    return crud.create_product(db, product)
+
+# ========== UTILS : OCR PDF SIMPLE ==========
+
+async def extract_text_from_pdf(content: bytes) -> str:
+    """
+    Extraction simple du texte d'un PDF avec pdfplumber.
+    """
+    try:
+        text_content = ""
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            for page in pdf.pages:
+                if page.extract_text():
+                    text_content += page.extract_text()
+        return text_content.strip()
+    except Exception as e:
+        print("Erreur lecture PDF:", e)
+        return ""
+
+# ========== UTILS : ANALYSE D'UNE IMAGE AVEC OPENAI ASSISTANT ==========
+
+async def analyse_image_with_openai(file_content: bytes, filename: str) -> str:
+    """
+    Envoie une image à l'Assistant OpenAI pour l'analyser.
+    """
+    try:
+        uploaded_file = openai.files.create(
+            file=(filename, io.BytesIO(file_content), "image/jpeg"),
+            purpose="assistants"
+        )
+
+        assistant = openai.beta.assistants.create(
+            name="Objex Vision Assistant",
+            instructions=(
+                "Tu es un expert en analyse de produits industriels. "
+                "Analyse précisément les fichiers et textes fournis. "
+                "Ton objectif est de produire une **fiche technique stricte et concise**, contenant uniquement les informations suivantes si disponibles :\n"
+                "- **Marque**\n"
+                "- **Modèle**\n"
+                "- **Puissance** (en Watts, Volts, Hertz)\n"
+                "- **Dimensions** (en mm)\n"
+                "- **Indice de protection** (IP)\n"
+                "- **Numéro de série**\n"
+                "- **Certifications et Normes** (ex: CE, NF)\n"
+                "- **Pays de fabrication**\n"
+                "- **Autres caractéristiques techniques importantes**\n\n"
+                "Structure la réponse avec des titres clairs et des listes à puces.\n"
+                "NE DONNE AUCUN conseil d'utilisation, d'achat, de sécurité ou d'installation.\n"
+                "NE RÉPONDS PAS par des phrases inutiles ou du texte commercial."
+            ),
+            model="gpt-4o",
+            tools=[{"type": "code_interpreter"}]
+        )
+
+        thread = openai.beta.threads.create()
+
+        openai.beta.threads.messages.create(
+            thread_id=thread.id,
+            role="user",
+            content=[
+                {
+                    "type": "text",
+                    "text": "Merci d'analyser cette image industrielle."
+                },
+                {
+                    "type": "image_file",
+                    "image_file": {
+                        "file_id": uploaded_file.id
+                    }
+                }
+            ]
+        )
+
+        run = openai.beta.threads.runs.create(
+            thread_id=thread.id,
+            assistant_id=assistant.id,
+        )
+
+        while run.status not in ["completed", "failed"]:
+            time.sleep(2)
+            run = openai.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
+
+        messages = openai.beta.threads.messages.list(thread_id=thread.id)
+        final_response = messages.data[0].content[0].text.value
+
+        return final_response
+
+    except Exception as e:
+        print("Erreur analyse image:", e)
+        return f"Erreur d'analyse OpenAI : {str(e)}"
+
+# ========== UTILS : FUSIONNER ET ANALYSER TOUT (IMAGES, TEXTES, PDF) ==========
+
+async def fusionner_et_analyser(image_texts: List[str], ocr_texts: List[str], user_texts: List[str]) -> str:
+    """
+    Fusionne tous les extraits d'indices pour demander une analyse globale à OpenAI.
+    """
+    try:
+        messages = [
+            {"role": "system", "content": (
+                    "Tu es un expert en analyse d'objets industriels, techniques et électroniques. "
+                    "À partir des données fournies (textes, photos, pdf), génère une FICHE PRODUIT structurée.\n\n"
+                    "Structure ta réponse EXACTEMENT ainsi :\n"
+                    "- **Titre** : Propose un titre clair et concis en moins de 100 caractères.\n"
+                    "- **Description** : Rédige un résumé technique sobre (pas de blabla commercial).\n"
+                    "- **Fiche Technique** : liste les caractéristiques détectées sous forme de liste à puces :\n"
+                    "  - Marque\n"
+                    "  - Modèle\n"
+                    "  - Puissance (Watts, Volts, Hertz)\n"
+                    "  - Dimensions (mm)\n"
+                    "  - IP (Indice de protection)\n"
+                    "  - Numéro de série\n"
+                    "  - Certifications (CE, NF...)\n"
+                    "  - Pays ou lieu de fabrication\n"
+                    "  - Année de fabrication\n"
+                    "  - Autres options spécifiques\n\n"
+                    "Si une information est absente, indique 'Non précisé'.\n"
+                    "NE DONNE AUCUN CONSEIL D'UTILISATION, D'ACHAT OU DE SÉCURITÉ.\n"
+                    "Réponse 100% structurée et sobre."
+                )}
+        ]
+
+        for text in image_texts:
+            if text:
+                messages.append({
+                    "role": "user",
+                    "content": text
+                })
+
+        for text in ocr_texts:
+            if text:
+                messages.append({
+                    "role": "user",
+                    "content": text
+                })
+
+        for text in user_texts:
+            if text:
+                messages.append({
+                    "role": "user",
+                    "content": text
+                })
+
+        print("Contenu fusionné envoyé à OpenAI :", messages)
+
+        chat_completion = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages,
+        )
+
+        return chat_completion.choices[0].message.content
+
+        import re
+
+        def parser_reponse_ia(texte):
+            titre = ""
+            description = ""
+            fiche_technique = ""
+
+            titre_match = re.search(r"\*\*Titre\*\* ?: ?(.*)", texte)
+            description_match = re.search(r"\*\*Description\*\* ?: ?(.*)", texte)
+            fiche_match = re.search(r"\*\*Fiche Technique\*\* ?:?([\s\S]*)", texte)
+
+            if titre_match:
+                titre = titre_match.group(1).strip()
+
+            if description_match:
+                description = description_match.group(1).strip()
+
+            if fiche_match:
+                fiche_technique = fiche_match.group(1).strip()
+
+            return {
+                "titre": titre,
+                "description": description,
+                "fiche_technique": fiche_technique
+            }
+
+
+    except Exception as e:
+        print("Erreur analyse fusionnée:", e)
+        return "Erreur pendant l'analyse fusionnée."
+
+# ========== ROUTE PRINCIPALE D'ANALYSE ==========
+
 @app.post("/analyse")
 async def analyse_indices(files: List[UploadFile] = File(default=[]), texts: List[str] = Form(default=[])):
-    print("fichiers_reçus :", [f.filename for f in files])
-    print("textes_reçus :", texts)
+    print("Fichiers reçus :", [f.filename for f in files])
+    print("Textes reçus :", texts)
 
     results = {
         "analyse_fichiers": [],
         "analyse_textes": [],
     }
 
+    image_texts = []
+    ocr_texts = []
+    user_texts = texts
+
     for file in files:
         content = await file.read()
         filename = file.filename.lower()
 
         if filename.endswith((".jpg", ".jpeg", ".png")):
-            try:
-                image = Image.open(io.BytesIO(content))
-
-                # 🔧 Convertir en niveaux de gris
-                gray = image.convert("L")
-
-                # 🔧 Binarisation pour améliorer le contraste
-                bw = gray.point(lambda x: 0 if x < 128 else 255, '1')
-
-                # 🔍 Lancer OCR avec un mode adapté au texte aligné (étiquette)
-                ocr_result = pytesseract.image_to_string(bw, config="--psm 6")
-
-                print("🧠 OCR:", repr(ocr_result))
-
-                results["analyse_fichiers"].append({
-                    "filename": file.filename,
-                    "type": "image",
-                    "extrait": ocr_result.strip() or "OCR n’a rien trouvé."
-                })
-
-            except Exception as e:
-                results["analyse_fichiers"].append({
-                    "filename": file.filename,
-                    "type": "image",
-                    "erreur": str(e)
-                })
+            analyse_result = await analyse_image_with_openai(content, filename)
+            image_texts.append(analyse_result)
+            results["analyse_fichiers"].append({
+                "filename": file.filename,
+                "type": "image",
+                "analyse_ia": analyse_result
+            })
 
         elif filename.endswith(".pdf"):
-            try:
-                text_content = ""
-                with pdfplumber.open(io.BytesIO(content)) as pdf:
-                    for page in pdf.pages:
-                        if page.extract_text():
-                            text_content += page.extract_text()
-
-                if not text_content.strip():
-                    # Fallback OCR PDF
-                    import tempfile, ocrmypdf, os
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_in:
-                        temp_in.write(content)
-                        temp_in.flush()
-                        temp_out = temp_in.name.replace(".pdf", "_ocr.pdf")
-                        ocrmypdf.ocr(temp_in.name, temp_out, force_ocr=True)
-
-                        with pdfplumber.open(temp_out) as pdf_ocr:
-                            for page in pdf_ocr.pages:
-                                if page.extract_text():
-                                    text_content += page.extract_text()
-
-                    os.remove(temp_out)
-                    os.remove(temp_in.name)
-
-                results["analyse_fichiers"].append({
-                    "filename": file.filename,
-                    "type": "pdf",
-                    "extrait": text_content.strip() or "OCR n'a rien trouvé."
-                })
-
-            except Exception as e:
-                results["analyse_fichiers"].append({
-                    "filename": file.filename,
-                    "type": "pdf",
-                    "erreur": str(e)
-                })
-
-    for text in texts:
-        if text.startswith("http://") or text.startswith("https://"):
-            # ➡️ C'est un lien web ➔ traiter comme URL
-            url_infos = analyse_url(text)
-            results["analyse_textes"].append({
-                "type": "url",
-                "infos": url_infos
+            extracted_text = await extract_text_from_pdf(content)
+            ocr_texts.append(extracted_text)
+            results["analyse_fichiers"].append({
+                "filename": file.filename,
+                "type": "pdf",
+                "texte_detecté": extracted_text
             })
-        else:
-            # ➡️ Sinon traiter comme texte normal
-            mots = text.split()
-            mots_importants = [m for m in mots if len(m) > 3]
-            results["analyse_textes"].append({
-                "type": "texte",
-                "texte_original": text,
-                "mots_importants": mots_importants
-            })
+
+    # ➡️ Analyse globale fusionnée
+    texte_global = await fusionner_et_analyser(image_texts, ocr_texts, user_texts)
+    results["analyse_globale"] = texte_global
 
     return {
-        "message": "Analyse réussie ✅",
+        "message": "Analyse complète IA réussie ✅",
         "details": results
     }
