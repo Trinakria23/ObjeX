@@ -1,5 +1,8 @@
-import React, { useEffect, useState } from "react";
+import React from "react";
+import { useEffect, useState } from "react";
 import axios from "axios";
+import { motion } from "framer-motion";
+import { Link } from "react-router-dom";
 
 export default function ProductList({ onSelect }) {
   const [products, setProducts] = useState([]);
@@ -23,7 +26,7 @@ export default function ProductList({ onSelect }) {
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
           {products.map((product) => (
               <Link 
-                key={product.id} 
+                to={`/product/${product.id}`}
                 onClick={() => onSelect(product.id)} // 🛠️ Important ici !!! 
                 className="cursor-pointer bg-white p-6 rounded-lg shadow-md hover:shadow-xl transition"
               >
