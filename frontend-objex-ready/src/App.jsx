@@ -9,7 +9,7 @@ export default function App() {
   return (
     <div className="min-h-screen bg-gray-100 p-6">
       <h1 className="text-4xl font-bold text-center mb-8 text-blue-700">
-        Objex - Gestion des Objets
+        ObjeX - Gestion des Objets
       </h1>
 
       <div className="max-w-6xl mx-auto">
@@ -23,7 +23,14 @@ export default function App() {
             <IndicesCloud />
           </>
         ) : (
-          <ProductDetail id={selectedProductId} onBack={() => setSelectedProductId(null)} />
+          <>
+            <ProductDetail id={selectedProductId} onBack={() => setSelectedProductId(null)} />
+            <hr className="my-10" />
+            <h2 className="text-2xl font-semibold mb-4 text-blue-600">
+              Nuage d'indices
+            </h2>
+            <IndicesCloud />
+          </>
         )}
       </div>
     </div>
