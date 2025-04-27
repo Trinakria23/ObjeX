@@ -3,7 +3,7 @@ import { useDropzone } from "react-dropzone";
 import { motion, AnimatePresence } from "framer-motion";
 import axios from "axios";
 
-export default function IndicesCloud() {
+export default function IndicesCloud({ selectedProduct }) {
   const [indices, setIndices] = useState([]);
   const [textInput, setTextInput] = useState("");
 
@@ -111,17 +111,19 @@ const handleSaveAnalysis = async () => {
     numero_serie: analyseResult.numero_serie || "",
     certifications: analyseResult.certifications || "",
     pays_fabrication: analyseResult.pays_fabrication || "",
-    resume_ia: JSON.stringify(analyseResult), // tu stockes aussi toute l'analyse brute si besoin
+    resume_ia: JSON.stringify(analyseResult),
   };
 
   try {
-    await axios.post("http://localhost:8000/save_analysis", dataToSave);
+    await axios.put(`http://localhost:8000/products/${selectedProduct.id}`, dataToSave);
     alert("Analyse sauvegardée ✅");
   } catch (error) {
     console.error("Erreur sauvegarde :", error);
     alert("Erreur lors de la sauvegarde");
   }
 };
+
+
   return (
     <div className="space-y-6">
       <h3 className="text-xl font-bold text-center">Ajoutez vos indices</h3>
